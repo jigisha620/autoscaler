@@ -24,9 +24,9 @@ import (
 
 // Interface provides access to all the informers in this group version.
 type Interface interface {
-	// VerticalPodAutoscalers returns a TypedVerticalPodAutoscalerInformer.
+	// VerticalPodAutoscalers returns a VerticalPodAutoscalerInformer.
 	VerticalPodAutoscalers() TypedVerticalPodAutoscalerInformer
-	// VerticalPodAutoscalerCheckpoints returns a TypedVerticalPodAutoscalerCheckpointInformer.
+	// VerticalPodAutoscalerCheckpoints returns a VerticalPodAutoscalerCheckpointInformer.
 	VerticalPodAutoscalerCheckpoints() TypedVerticalPodAutoscalerCheckpointInformer
 }
 

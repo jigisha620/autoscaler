@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/api/resource"
 	kube_flag "k8s.io/component-base/cli/flag"
 	"k8s.io/klog/v2"
 
@@ -54,6 +55,9 @@ type UpdaterConfig struct {
 	EvictAfterOOMThreshold     time.Duration
 
 	ConcurrentCPUStartupBoostSyncs int
+
+	PublishResourceHints bool
+	MaxAllowedCPUBoost   resource.QuantityValue
 }
 
 // DefaultUpdaterConfig returns a UpdaterConfig with default values
@@ -79,6 +83,9 @@ func DefaultUpdaterConfig() *UpdaterConfig {
 		EvictAfterOOMThreshold:     10 * time.Minute,
 
 		ConcurrentCPUStartupBoostSyncs: 1,
+
+		PublishResourceHints: false,
+		MaxAllowedCPUBoost:   resource.QuantityValue{},
 	}
 }
 
@@ -103,6 +110,8 @@ func InitUpdaterFlags() *UpdaterConfig {
 	flag.Float64Var(&config.DefaultUpdateThreshold, "pod-update-threshold", config.DefaultUpdateThreshold, "Ignore updates that have priority lower than the value of this flag")
 	flag.DurationVar(&config.PodLifetimeUpdateThreshold, "in-recommendation-bounds-eviction-lifetime-threshold", config.PodLifetimeUpdateThreshold, "Pods that live for at least that long can be evicted even if their request is within the [MinRecommended...MaxRecommended] range")
 	flag.DurationVar(&config.EvictAfterOOMThreshold, "evict-after-oom-threshold", config.EvictAfterOOMThreshold, `The default duration to evict pods that have OOMed in less than evict-after-oom-threshold since start.`)
+	flag.BoolVar(&config.PublishResourceHints, "publish-resource-hints", config.PublishResourceHints, "[ALPHA] If true, updater publishes Pod status.resourceHints through the pods/resourcehints subresource. Requires the PodResourceHints feature gate on the API server.")
+	flag.Var(&config.MaxAllowedCPUBoost, "max-allowed-cpu-boost", "Maximum CPU applied to a boosted container. Must match the admission controller's flag. Used only for resource hints.")
 	flag.IntVar(&config.ConcurrentCPUStartupBoostSyncs, "concurrent-cpu-startup-boost-syncs", config.ConcurrentCPUStartupBoostSyncs, "The number of workers processing CPU startup boost unboosting concurrently.")
 
 	// These need to happen last. kube_flag.InitFlags() synchronizes and parses

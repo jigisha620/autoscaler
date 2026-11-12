@@ -60,9 +60,80 @@ func (*resourcesUpdatesPatchCalculator) PatchResourceTarget() PatchResourceTarge
 func (c *resourcesUpdatesPatchCalculator) CalculatePatches(pod *corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) ([]resource_admission.PatchRecord, error) {
 	result := []resource_admission.PatchRecord{}
 
+	nr, err := c.newPodResources(pod, vpa)
+	if err != nil {
+		return []resource_admission.PatchRecord{}, err
+	}
+
+	updatesAnnotation := []string{}
+	for i := range nr.resources {
+		if nr.skipped[i] {
+			continue
+		}
+		if nr.boosted[i] {
+			originalResources, err := annotations.GetOriginalResourcesAnnotationValue(&pod.Spec.Containers[i])
+			if err != nil {
+				return nil, err
+			}
+			annotationKey := annotations.GetStartupCPUBoostAnnotationKey(pod.Spec.Containers[i].Name)
+			result = append(result, GetAddAnnotationPatch(annotationKey, originalResources))
+		}
+
+		newPatches, newUpdatesAnnotation := getContainerPatch(pod, i, nr.annotations, nr.resources[i])
+		if len(newPatches) > 0 {
+			result = append(result, newPatches...)
+			updatesAnnotation = append(updatesAnnotation, newUpdatesAnnotation)
+		}
+	}
+
+	if len(updatesAnnotation) > 0 {
+		vpaAnnotationValue := fmt.Sprintf("Pod resources updated by %s: %s", vpa.Name, strings.Join(updatesAnnotation, "; "))
+		result = append(result, GetAddAnnotationPatch(ResourceUpdatesAnnotation, vpaAnnotationValue))
+	}
+	return result, nil
+}
+
+// ReplacementCalculator computes the container resources the admission
+// controller would set on a new pod created from the same owner right now.
+type ReplacementCalculator interface {
+	// CalculateReplacementResources returns per-container resources, 1-1 with
+	// pod.Spec.Containers, including CPU startup boost.
+	CalculateReplacementResources(pod *corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) ([]vpa_api_util.ContainerResources, error)
+}
+
+// NewReplacementCalculator returns a ReplacementCalculator that uses the
+// same logic as the admission controller's resource updates calculator.
+func NewReplacementCalculator(recommendationProvider recommendation.Provider, maxAllowedCPUBoost resource.QuantityValue) ReplacementCalculator {
+	return &resourcesUpdatesPatchCalculator{
+		recommendationProvider: recommendationProvider,
+		maxAllowedCPUBoost:     maxAllowedCPUBoost.Quantity,
+	}
+}
+
+func (c *resourcesUpdatesPatchCalculator) CalculateReplacementResources(pod *corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) ([]vpa_api_util.ContainerResources, error) {
+	nr, err := c.newPodResources(pod, vpa)
+	if err != nil {
+		return nil, err
+	}
+	for i := range nr.resources {
+		if nr.skipped[i] {
+			nr.resources[i] = vpa_api_util.ContainerResources{}
+		}
+	}
+	return nr.resources, nil
+}
+
+type newPodResources struct {
+	resources   []vpa_api_util.ContainerResources
+	annotations vpa_api_util.ContainerToAnnotationsMap
+	boosted     []bool
+	skipped     []bool
+}
+
+func (c *resourcesUpdatesPatchCalculator) newPodResources(pod *corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) (newPodResources, error) {
 	containersResources, annotationsPerContainer, err := c.recommendationProvider.GetContainersResourcesForPod(pod, vpa)
 	if err != nil {
-		return []resource_admission.PatchRecord{}, fmt.Errorf("failed to calculate resource patch for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		return newPodResources{}, fmt.Errorf("failed to calculate resource patch for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 	}
 
 	if vpa_api_util.GetUpdateMode(vpa) == vpa_types.UpdateModeOff {
@@ -79,35 +150,32 @@ func (c *resourcesUpdatesPatchCalculator) CalculatePatches(pod *corev1.Pod, vpa 
 		annotationsPerContainer = vpa_api_util.ContainerToAnnotationsMap{}
 	}
 
-	updatesAnnotation := []string{}
-	cpuStartupBoostEnabled := features.Enabled(features.CPUStartupBoost)
+	nr := newPodResources{
+		resources:   containersResources,
+		annotations: annotationsPerContainer,
+		boosted:     make([]bool, len(containersResources)),
+		skipped:     make([]bool, len(containersResources)),
+	}
+	if !features.Enabled(features.CPUStartupBoost) {
+		return nr, nil
+	}
 	for i := range containersResources {
-		// Apply startup boost if configured
-		if cpuStartupBoostEnabled {
-			// Get the container resource policy to check for scaling mode.
-			policy := vpa_api_util.GetContainerResourcePolicy(pod.Spec.Containers[i].Name, vpa.Spec.ResourcePolicy)
-			if policy != nil && policy.Mode != nil && *policy.Mode == vpa_types.ContainerScalingModeOff {
-				continue
-			}
-			boostPatches, err := c.applyCPUStartupBoost(&pod.Spec.Containers[i], vpa, &containersResources[i])
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, boostPatches...)
+		// Get the container resource policy to check for scaling mode.
+		policy := vpa_api_util.GetContainerResourcePolicy(pod.Spec.Containers[i].Name, vpa.Spec.ResourcePolicy)
+		if policy != nil && policy.Mode != nil && *policy.Mode == vpa_types.ContainerScalingModeOff {
+			nr.skipped[i] = true
+			continue
 		}
-
-		newPatches, newUpdatesAnnotation := getContainerPatch(pod, i, annotationsPerContainer, containersResources[i])
-		if len(newPatches) > 0 {
-			result = append(result, newPatches...)
-			updatesAnnotation = append(updatesAnnotation, newUpdatesAnnotation)
+		startupBoostPolicy := getContainerStartupBoostPolicy(&pod.Spec.Containers[i], vpa)
+		if startupBoostPolicy == nil {
+			continue
 		}
+		if err := c.applyControlledCPUResources(&pod.Spec.Containers[i], vpa, &containersResources[i], startupBoostPolicy); err != nil {
+			return newPodResources{}, err
+		}
+		nr.boosted[i] = true
 	}
-
-	if len(updatesAnnotation) > 0 {
-		vpaAnnotationValue := fmt.Sprintf("Pod resources updated by %s: %s", vpa.Name, strings.Join(updatesAnnotation, "; "))
-		result = append(result, GetAddAnnotationPatch(ResourceUpdatesAnnotation, vpaAnnotationValue))
-	}
-	return result, nil
+	return nr, nil
 }
 
 func getContainerPatch(pod *corev1.Pod, i int, annotationsPerContainer vpa_api_util.ContainerToAnnotationsMap, containerResources vpa_api_util.ContainerResources) ([]resource_admission.PatchRecord, string) {
@@ -140,29 +208,6 @@ func appendPatchesAndAnnotations(patches []resource_admission.PatchRecord, annot
 		annotations = append(annotations, fmt.Sprintf("%s %s", resource, resourceName))
 	}
 	return patches, annotations
-}
-
-func (c *resourcesUpdatesPatchCalculator) applyCPUStartupBoost(container *corev1.Container, vpa *vpa_types.VerticalPodAutoscaler, containerResources *vpa_api_util.ContainerResources) ([]resource_admission.PatchRecord, error) {
-	var patches []resource_admission.PatchRecord
-
-	startupBoostPolicy := getContainerStartupBoostPolicy(container, vpa)
-	if startupBoostPolicy == nil {
-		return nil, nil
-	}
-
-	err := c.applyControlledCPUResources(container, vpa, containerResources, startupBoostPolicy)
-	if err != nil {
-		return nil, err
-	}
-
-	originalResources, err := annotations.GetOriginalResourcesAnnotationValue(container)
-	if err != nil {
-		return nil, err
-	}
-	annotationKey := annotations.GetStartupCPUBoostAnnotationKey(container.Name)
-	patches = append(patches, GetAddAnnotationPatch(annotationKey, originalResources))
-
-	return patches, nil
 }
 
 func getContainerStartupBoostPolicy(container *corev1.Container, vpa *vpa_types.VerticalPodAutoscaler) *vpa_types.StartupBoost {

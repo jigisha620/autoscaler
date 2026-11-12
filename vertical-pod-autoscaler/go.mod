@@ -31,10 +31,18 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-openapi/jsonpointer v1.0.2 // indirect
 	github.com/go-openapi/jsonreference v1.0.3 // indirect
+	github.com/go-openapi/swag v0.27.1 // indirect
+	github.com/go-openapi/swag/cmdutils v0.27.1 // indirect
 	github.com/go-openapi/swag/conv v0.29.2 // indirect
+	github.com/go-openapi/swag/fileutils v0.27.1 // indirect
 	github.com/go-openapi/swag/jsonutils v0.29.2 // indirect
+	github.com/go-openapi/swag/loading v0.27.1 // indirect
+	github.com/go-openapi/swag/mangling v0.27.1 // indirect
+	github.com/go-openapi/swag/netutils v0.27.1 // indirect
 	github.com/go-openapi/swag/pools v0.29.2 // indirect
+	github.com/go-openapi/swag/stringutils v0.27.1 // indirect
 	github.com/go-openapi/swag/typeutils v0.29.2 // indirect
+	github.com/go-openapi/swag/yamlutils v0.27.1 // indirect
 	github.com/google/gnostic-models v0.7.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
@@ -68,7 +76,7 @@ require (
 	k8s.io/kube-openapi v0.0.0-20260929181212-2cfbdf149b9a // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
-	sigs.k8s.io/structured-merge-diff/v7 v7.0.0 // indirect
+	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
@@ -77,4 +85,14 @@ exclude (
 	k8s.io/client-go v1.5.0
 	k8s.io/client-go v1.5.1
 	k8s.io/client-go v1.5.2
+)
+
+replace (
+	k8s.io/api => ../../kubernetes/staging/src/k8s.io/api
+	k8s.io/apimachinery => ../../kubernetes/staging/src/k8s.io/apimachinery
+	k8s.io/client-go => ../../kubernetes/staging/src/k8s.io/client-go
+	k8s.io/code-generator => ../../kubernetes/staging/src/k8s.io/code-generator
+	k8s.io/component-base => ../../kubernetes/staging/src/k8s.io/component-base
+	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad
+	k8s.io/metrics => ../../kubernetes/staging/src/k8s.io/metrics
 )

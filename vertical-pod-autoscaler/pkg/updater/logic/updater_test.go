@@ -18,6 +18,7 @@ package logic
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"testing"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
@@ -51,6 +53,7 @@ import (
 	target_mock "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/mock"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/inplace"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/priority"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/resourcehints"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/restriction"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/utils"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
@@ -1186,4 +1189,97 @@ func TestProcessNextBoostItem_RetryExhaustion_ThenResync(t *testing.T) {
 	assert.True(t, u.processNextBoostItem(ctx))
 	inplace.AssertNumberOfCalls(t, "InPlaceUpdate", 1)
 	assert.Equal(t, 0, queue.Len(), "queue should be empty after successful unboost")
+}
+
+func TestRunOnce_PublishesResourceHints(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	replicas := int32(2)
+	labels := map[string]string{"app": "testingApp"}
+	selector := parseLabelSelector("app = testingApp")
+	containerName := "container1"
+	rc := corev1.ReplicationController{
+		TypeMeta:   metav1.TypeMeta{Kind: "ReplicationController", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "rc", Namespace: "default"},
+		Spec:       corev1.ReplicationControllerSpec{Replicas: &replicas},
+	}
+	vpaObj := test.VerticalPodAutoscaler().
+		WithContainer(containerName).
+		WithUpdateMode(vpa_types.UpdateModeInPlaceOrRecreate).
+		WithTarget("2", "200M").
+		WithTargetRef(&autoscalingv1.CrossVersionObjectReference{Kind: rc.Kind, Name: rc.Name, APIVersion: rc.APIVersion}).
+		Get()
+
+	controlled := test.Pod().WithName("controlled").
+		AddContainer(test.Container().WithName(containerName).WithCPURequest(resource.MustParse("1")).WithMemRequest(resource.MustParse("200M")).Get()).
+		WithCreator(&rc.ObjectMeta, &rc.TypeMeta).Get()
+	controlled.Labels = labels
+	orphan := test.Pod().WithName("orphan").
+		AddContainer(test.Container().WithName(containerName).WithCPURequest(resource.MustParse("1")).Get()).Get()
+	orphan.Status.ResourceHints = []corev1.PodResourceHint{{Manager: resourcehints.ManagerName}}
+
+	inplaceMock := &test.PodsInPlaceRestrictionMock{}
+	inplaceMock.On("CanInPlaceUpdate", controlled).Return(utils.InPlaceDeferred)
+	factory := &restriction.FakePodsRestrictionFactory{Eviction: &test.PodsEvictionRestrictionMock{}, InPlace: inplaceMock}
+	vpaLister := &test.VerticalPodAutoscalerListerMock{}
+	vpaLister.On("List").Return([]*vpa_types.VerticalPodAutoscaler{vpaObj}, nil).Once()
+	podLister := &test.PodListerMock{}
+	podLister.On("List").Return([]*corev1.Pod{controlled, orphan}, nil).Once()
+	mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+	mockSelectorFetcher.EXPECT().Fetch(gomock.Eq(vpaObj)).Return(selector, nil)
+
+	client := fake.NewClientset()
+	var patches []k8stesting.PatchActionImpl
+	client.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		patches = append(patches, action.(k8stesting.PatchActionImpl))
+		return true, &corev1.Pod{}, nil
+	})
+	lr := limitrange.NewNoopLimitsCalculator()
+	processor := vpa_api_util.NewCappingRecommendationProcessor(lr)
+	publisher := resourcehints.NewPublisher(client, resourcehints.NewCalculator(
+		patch.NewReplacementCalculator(recommendation.NewProvider(lr, processor), resource.QuantityValue{})), 0.1)
+
+	u := &updater{
+		vpaLister:                    vpaLister,
+		podLister:                    podLister,
+		restrictionFactory:           factory,
+		evictionRateLimiter:          rate.NewLimiter(rate.Inf, 0),
+		inPlaceRateLimiter:           rate.NewLimiter(rate.Inf, 0),
+		evictionAdmission:            priority.NewDefaultPodEvictionAdmission(),
+		recommendationProcessor:      &test.FakeRecommendationProcessor{},
+		selectorFetcher:              mockSelectorFetcher,
+		controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
+		useAdmissionControllerStatus: false,
+		priorityProcessor:            priority.NewProcessor(),
+		infeasibleAttempts:           make(map[types.UID]*vpa_types.RecommendedPodResources),
+		hintPublisher:                publisher,
+	}
+	u.RunOnce(context.Background())
+
+	inplaceMock.AssertNumberOfCalls(t, "InPlaceUpdate", 0)
+	byName := map[string]k8stesting.PatchActionImpl{}
+	for _, p := range patches {
+		assert.Equal(t, "resourcehints", p.GetSubresource())
+		assert.Equal(t, types.ApplyPatchType, p.GetPatchType())
+		assert.Equal(t, resourcehints.ManagerName, p.PatchOptions.FieldManager)
+		byName[p.GetName()] = p
+	}
+	require.Len(t, byName, 2)
+
+	var body struct {
+		Status corev1.PodStatus `json:"status"`
+	}
+	require.NoError(t, json.Unmarshal(byName["controlled"].GetPatch(), &body))
+	require.Len(t, body.Status.ResourceHints, 1)
+	h := body.Status.ResourceHints[0]
+	require.NotNil(t, h.Replacement)
+	require.Len(t, h.Replacement.Containers, 1)
+	assert.Equal(t, "2", h.Replacement.Containers[0].Requests.Cpu().String())
+	_, hasMem := h.Replacement.Containers[0].Requests[corev1.ResourceMemory]
+	assert.False(t, hasMem, "memory equals current request and must be omitted")
+
+	body.Status = corev1.PodStatus{}
+	require.NoError(t, json.Unmarshal(byName["orphan"].GetPatch(), &body))
+	assert.Empty(t, body.Status.ResourceHints)
 }

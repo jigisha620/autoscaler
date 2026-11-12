@@ -50,6 +50,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/priority"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/resourcehints"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/restriction"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/utils"
 	metrics_updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/updater"
@@ -106,6 +107,7 @@ type updater struct {
 	evictAfterOOMThreshold       time.Duration
 	podInformer                  cache.SharedIndexInformer
 	cpuStartupBoostQueue         workqueue.TypedRateLimitingInterface[string]
+	hintPublisher                *resourcehints.Publisher
 }
 
 // NewUpdater creates Updater with given configuration
@@ -134,6 +136,7 @@ func NewUpdater(
 	namespace string,
 	ignoredNamespaces []string,
 	patchCalculators []patch.Calculator,
+	hintPublisher *resourcehints.Publisher,
 ) (Updater, error) {
 	evictionRateLimiter := getRateLimiter(evictionRateLimit, evictionRateBurst)
 	// TODO: Create in-place rate limits for the in-place rate limiter
@@ -171,6 +174,7 @@ func NewUpdater(
 		defaultUpdateThreshold:     defaultUpdateThreshold,
 		podLifetimeUpdateThreshold: podLifetimeUpdateThreshold,
 		evictAfterOOMThreshold:     evictAfterOOMThreshold,
+		hintPublisher:              hintPublisher,
 	}
 	if features.Enabled(features.CPUStartupBoost) {
 		u.podInformer = podInformerFactory.Core().V1().Pods().Informer()
@@ -272,6 +276,8 @@ func (u *updater) RunOnce(ctx context.Context) {
 		controllingVPA := vpa_api_util.GetControllingVPAForPod(ctx, pod, vpas, u.controllerFetcher)
 		if controllingVPA != nil {
 			controlledPods[controllingVPA.Vpa] = append(controlledPods[controllingVPA.Vpa], pod)
+		} else {
+			u.removeResourceHint(ctx, pod)
 		}
 	}
 
@@ -319,6 +325,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 
 		inPlaceLimiter := u.restrictionFactory.NewPodsInPlaceRestriction(creatorToSingleGroupStatsMap, podToReplicaCreatorMap)
 		withInPlaceUpdated := false
+		hintReasons := make(map[types.UID]resourcehints.Reason)
 
 		// Exclude pods with an active CPU startup boost from standard eviction/in-place processing.
 		// These pods are handled separately by the RunBoostWorker queue, which unbooosts them
@@ -331,6 +338,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 		}
 
 		if updateMode == vpa_types.UpdateModeOff || updateMode == vpa_types.UpdateModeInitial {
+			u.publishResourceHints(ctx, vpa, livePods, hintReasons)
 			continue
 		}
 
@@ -350,6 +358,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 			// If the feature gate is not enabled but update mode is InPlace, updater will do nothing.
 			if updateMode == vpa_types.UpdateModeInPlace {
 				klog.InfoS("Warning: feature gate is not enabled for this updateMode", "featuregate", features.InPlace, "updateMode", updateMode)
+				u.publishResourceHints(ctx, vpa, livePods, hintReasons)
 				continue
 			}
 			// We evict the pod when the mode is set to Recreate or Auto. The latter mode is deprecated.
@@ -361,6 +370,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 		}
 
 		withEvicted := false
+		evictedPods := set.New[types.UID]()
 
 		for _, pod := range podsForInPlace {
 			decision := inPlaceLimiter.CanInPlaceUpdate(pod, vpa, u.infeasibleAttempts)
@@ -426,6 +436,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 				continue
 			}
 			withInPlaceUpdated = true
+			hintReasons[pod.UID] = resourcehints.ReasonResized
 			metrics_updater.AddInPlaceUpdatedPod(vpaSize, vpa.Name, vpa.Namespace)
 		}
 
@@ -446,9 +457,14 @@ func (u *updater) RunOnce(ctx context.Context) {
 				metrics_updater.RecordFailedEviction(vpaSize, vpa.Name, vpa.Namespace, updateMode, "EvictionError")
 			} else {
 				withEvicted = true
+				evictedPods.Insert(pod.UID)
 				metrics_updater.AddEvictedPod(vpaSize, vpa.Name, vpa.Namespace, updateMode)
 			}
 		}
+
+		u.publishResourceHints(ctx, vpa, filterPods(livePods, func(pod *corev1.Pod) bool {
+			return !evictedPods.Has(pod.UID)
+		}), hintReasons)
 
 		if withInPlaceUpdatable {
 			vpasWithInPlaceUpdatablePodsCounter.Add(vpaSize, 1)
@@ -464,6 +480,28 @@ func (u *updater) RunOnce(ctx context.Context) {
 		}
 	}
 	timer.ObserveStep("EvictPods")
+}
+
+// publishResourceHints writes the updater's status.resourceHints entry for
+// each pod. Errors are logged; hints are best effort.
+func (u *updater) publishResourceHints(ctx context.Context, vpa *vpa_types.VerticalPodAutoscaler, pods []*corev1.Pod, reasons map[types.UID]resourcehints.Reason) {
+	if u.hintPublisher == nil {
+		return
+	}
+	for _, pod := range pods {
+		if err := u.hintPublisher.Publish(ctx, pod, vpa, reasons[pod.UID]); err != nil {
+			klog.V(2).InfoS("Failed to publish resource hint", "pod", klog.KObj(pod), "vpa", klog.KObj(vpa), "error", err)
+		}
+	}
+}
+
+func (u *updater) removeResourceHint(ctx context.Context, pod *corev1.Pod) {
+	if u.hintPublisher == nil {
+		return
+	}
+	if err := u.hintPublisher.Remove(ctx, pod); err != nil {
+		klog.V(2).InfoS("Failed to remove resource hint", "pod", klog.KObj(pod), "error", err)
+	}
 }
 
 func (u *updater) cleanupStaleInfeasibleAttempts(livePodUIDs set.Set[types.UID]) {

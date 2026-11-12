@@ -257,17 +257,17 @@ func (f *sharedInformerFactory) InformerFor(obj runtime.Object, newFunc internal
 //	defer factory.Shutdown()    // Returns immediately if nothing was started.
 //	genericInformer := factory.ForResource(resource)
 //	typedInformer := factory.SomeAPIGroup().V1().SomeType()
-//	handle, err := typedInformer.Informer().AddEventHandler(...)
+//	handle, err := typeInformer.Informer().AddEventHandler(...)
 //	if err != nil {
 //	    return fmt.Errorf("register event handler: %v", err)
 //	}
-//	defer typedInformer.Informer().RemoveEventHandler(handle) // Avoids leaking goroutines.
+//	defer typeInformer.Informer().RemoveEventHandler(handle) // Avoids leaking goroutines.
 //	factory.StartWithContext(ctx)                            // Start processing these informers.
 //	synced := factory.WaitForCacheSyncWithContext(ctx)
 //	if err := synced.AsError(); err != nil {
 //	    return err
 //	}
-//	for v := range synced.Synced {
+//	for v := range synced {
 //	    // Only if desired log some information similar to this.
 //	    fmt.Fprintf(os.Stdout, "cache synced: %s", v)
 //	}

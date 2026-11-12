@@ -51,6 +51,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/inplace"
 	updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/logic"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/priority"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/resourcehints"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/client"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics"
@@ -192,6 +193,14 @@ func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
 
 	recommendationProvider := recommendation.NewProvider(limitRangeCalculator, vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalculator))
 
+	var hintPublisher *resourcehints.Publisher
+	if config.PublishResourceHints {
+		hintPublisher = resourcehints.NewPublisher(kubeClient,
+			resourcehints.NewCalculator(patch.NewReplacementCalculator(recommendationProvider, config.MaxAllowedCPUBoost)),
+			config.DefaultUpdateThreshold,
+		)
+	}
+
 	calculators := []patch.Calculator{inplace.NewResourceInPlaceUpdatesCalculator(recommendationProvider), inplace.NewInPlaceUpdatedCalculator(), inplace.NewUnboostAnnotationCalculator()}
 
 	updater, err := updater.NewUpdater(
@@ -219,6 +228,7 @@ func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
 		commonFlag.VpaObjectNamespace,
 		ignoredNamespaces,
 		calculators,
+		hintPublisher,
 	)
 	if err != nil {
 		klog.ErrorS(err, "Failed to create updater")
